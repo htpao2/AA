@@ -13,6 +13,13 @@ let CONTEXT_TTL_HOURS;
 let DEBUG_MODE;
 let VCP_API_TARGET_URL;
 
+// --- Idle Chat ---
+let IDLE_CHAT_ENABLED = false;
+let IDLE_CHAT_DELAY_MS = 300000; // 5 minutes default
+let IDLE_CHAT_PROMPT = "你好，我是 {{AgentName}}。最近在忙些什么？有什么新的发现或者有趣的项目可以分享吗？";
+let idleTimer = null;
+
+
 const AGENTS = {};
 const agentContexts = new Map();
 let pushVcpInfo = () => {}; // Default no-op function
@@ -34,10 +41,17 @@ function initialize(config, dependencies) {
     DEBUG_MODE = (config.DebugMode || "False").toLowerCase() === "true";
     VCP_API_TARGET_URL = `http://localhost:${VCP_SERVER_PORT}/v1`;
 
+    // Load Idle Chat configuration
+    IDLE_CHAT_ENABLED = (config.AGENT_IDLE_CHAT_ENABLED || 'false').toLowerCase() === 'true';
+    const idleDelayMinutes = parseInt(config.AGENT_IDLE_CHAT_DELAY_MINUTES || '5', 10);
+    IDLE_CHAT_DELAY_MS = idleDelayMinutes * 60 * 1000;
+    IDLE_CHAT_PROMPT = config.AGENT_IDLE_CHAT_PROMPT || "你好，我是 {{AgentName}}。最近在忙些什么？有什么新的发现或者有趣的项目可以分享吗？";
+
     if (DEBUG_MODE) {
         console.error(`[AgentAssistant Service] Initializing...`);
         console.error(`[AgentAssistant Service] VCP PORT: ${VCP_SERVER_PORT}, VCP Key: ${VCP_SERVER_ACCESS_KEY ? 'FOUND' : 'NOT FOUND'}`);
         console.error(`[AgentAssistant Service] History rounds: ${MAX_HISTORY_ROUNDS}, Context TTL: ${CONTEXT_TTL_HOURS}h.`);
+        console.error(`[AgentAssistant Service] Idle Chat Enabled: ${IDLE_CHAT_ENABLED}, Delay: ${idleDelayMinutes} mins.`);
     }
 
     loadAgentsFromLocalConfig();
@@ -52,6 +66,7 @@ function initialize(config, dependencies) {
     if (cleanupInterval) clearInterval(cleanupInterval);
     cleanupInterval = setInterval(periodicCleanup, 60 * 60 * 1000);
     
+    resetIdleTimer(); // Start the first idle timer
     console.log('[AgentAssistant Service] Initialized successfully.');
 }
 
@@ -62,6 +77,10 @@ function shutdown() {
     if (cleanupInterval) {
         clearInterval(cleanupInterval);
         if (DEBUG_MODE) console.error('[AgentAssistant Service] Context cleanup interval stopped.');
+    }
+    if (idleTimer) {
+        clearTimeout(idleTimer);
+        if (DEBUG_MODE) console.error('[AgentAssistant Service] Idle chat timer stopped.');
     }
     console.log('[AgentAssistant Service] Shutdown complete.');
 }
@@ -176,6 +195,83 @@ function periodicCleanup() {
     }
 }
 
+// --- Idle Chat Logic ---
+
+/**
+ * Resets the idle timer. If idle chat is enabled, it clears any existing
+ * timer and starts a new one.
+ */
+function resetIdleTimer() {
+    if (!IDLE_CHAT_ENABLED) return;
+
+    if (idleTimer) {
+        clearTimeout(idleTimer);
+    }
+
+    idleTimer = setTimeout(() => {
+        triggerIdleChat();
+    }, IDLE_CHAT_DELAY_MS);
+
+    if (DEBUG_MODE) {
+        console.log(`[AgentAssistant Service] Idle timer reset. Next check in ${IDLE_CHAT_DELAY_MS / 60000} minutes.`);
+    }
+}
+
+/**
+ * Triggers an automatic conversation between two randomly selected agents.
+ * This function is called by the idle timer.
+ */
+async function triggerIdleChat() {
+    const agentNames = Object.keys(AGENTS);
+    if (agentNames.length < 2) {
+        if (DEBUG_MODE) {
+            console.log("[AgentAssistant Service] Idle chat trigger skipped: Fewer than two agents are available.");
+        }
+        resetIdleTimer(); // Reset for the next period
+        return;
+    }
+
+    // Select two different random agents
+    let initiatorName = agentNames[Math.floor(Math.random() * agentNames.length)];
+    let responderName;
+    do {
+        responderName = agentNames[Math.floor(Math.random() * agentNames.length)];
+    } while (initiatorName === responderName);
+
+    const initiatorAgent = AGENTS[initiatorName];
+    const initialPrompt = await replacePlaceholdersInUserPrompt(IDLE_CHAT_PROMPT, initiatorAgent);
+    const idleSessionId = `idle_chat_session_${uuidv4()}`;
+
+    if (DEBUG_MODE) {
+        console.log(`[AgentAssistant Service] Idle chat triggered between ${initiatorName} and ${responderName}.`);
+        console.log(`[AgentAssistant Service] Initiator (${initiatorName}) says: "${initialPrompt}"`);
+    }
+
+    try {
+        // Call the tool internally to simulate a chat, flagging it as an idle chat
+        const result = await processToolCall(
+            {
+                agent_name: responderName,
+                prompt: initialPrompt,
+                session_id: idleSessionId
+            },
+            { isIdleChat: true }
+        );
+
+        if (result.status === 'success') {
+            if (DEBUG_MODE) console.log(`[AgentAssistant Service] Idle chat response from ${responderName}: "${result.result}"`);
+        } else {
+            console.error(`[AgentAssistant Service] Idle chat failed. Error from ${responderName}: ${result.error}`);
+        }
+    } catch (error) {
+        console.error(`[AgentAssistant Service] An unexpected error occurred during idle chat: ${error.message}`);
+    } finally {
+        // After an idle chat, we reset the timer again for the next cycle.
+        resetIdleTimer();
+    }
+}
+
+
 // --- Helper Functions ---
 
 async function replacePlaceholdersInUserPrompt(text, agentConfig) {
@@ -205,7 +301,11 @@ function parseAndValidateDate(dateString) {
  * @param {object} args - The arguments for the tool call.
  * @returns {Promise<object>} A promise that resolves to the result of the tool call.
  */
-async function processToolCall(args) {
+async function processToolCall(args, { isIdleChat = false } = {}) {
+    // Only reset the timer for external calls, not for internal idle chats.
+    if (!isIdleChat) {
+        resetIdleTimer();
+    }
     if (!VCP_SERVER_PORT || !VCP_SERVER_ACCESS_KEY) {
         const errorMsg = "AgentAssistant Critical Error: VCP Server PORT or Access Key is not configured.";
         if (DEBUG_MODE) console.error(`[AgentAssistant Service] ${errorMsg}`);
